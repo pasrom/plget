@@ -10,6 +10,7 @@
 #include "plget.h"
 #include "stat.h"
 #include "tx_lat.h"
+#include "xdp_sock.h"
 #include <poll.h>
 #include <unistd.h>
 #include <errno.h>
@@ -38,7 +39,7 @@ static int get_tx_tstamps(struct plgett *plget)
 	char *magic;
 
 	plget->msg.msg_controllen = sizeof(plget->control);
-	psize = recvmsg(plget->sock, msg, MSG_ERRQUEUE);
+	psize = recvmsg(plget->sfd, msg, MSG_ERRQUEUE);
 	if (psize < 0) {
 		perror("recvmsg error occured");
 		return -1;
@@ -69,19 +70,19 @@ static int get_tx_tstamps(struct plgett *plget)
 
 	if (!(plget->flags & PLF_TS_ID_ALLOWED)) {
 		/* check MAGIC number and get timestamp id */
-		magic = plget->magic_rd + psize;
+		magic = magic_rd(plget, psize);
 		if (*magic != MAGIC) {
-			printf("incorrect MAGIC number\n");
+			printf("incorrect MAGIC number 0x%x\n", *magic);
 			return -1;
 		}
 
-		ts_id = *(typeof(unsigned int) *)++magic;
+		ts_id = tid_rd(plget, psize);
 	} else {
 		ts_id = serr->ee_data;
 	}
 
 	if (!tss)
-		return plget->mod == EXT_LAT ? 0 : -1;
+		return plget->mod == RTT_MOD ? 0 : -1;
 
 	ts = tss->ts;
 	if (ts_type == SCM_TSTAMP_SCHED) {
@@ -110,6 +111,21 @@ static void txlat_stop_timer(int fd)
 	timerfd_settime(fd, 0, &tspec, NULL);
 }
 
+static int txlat_sendto(struct plgett *plget)
+{
+	int ret;
+
+	if (plget->pkt_type != PKT_XDP) {
+		ret = sendto(plget->sfd, plget->pkt, plget->sk_payload_size, 0,
+				(struct sockaddr *)&plget->sk_addr,
+				sizeof(plget->sk_addr));
+		return ret;
+	}
+
+	ret = xsk_sendto(plget);
+	return ret;
+}
+
 static int txlat_proc_packets(struct plgett *plget, int pkt_num)
 {
 	int tx_cnt = 0, rx_cnt = 0;
@@ -125,7 +141,7 @@ static int txlat_proc_packets(struct plgett *plget, int pkt_num)
 	if (timer_fd < 0)
 		return 1;
 
-	fds[0].fd = plget->sock;
+	fds[0].fd = plget->sfd;
 	fds[0].events = POLLERR;
 	fds[1].fd = timer_fd;
 	fds[1].events = POLLIN;
@@ -153,21 +169,18 @@ static int txlat_proc_packets(struct plgett *plget, int pkt_num)
 				goto err;
 			}
 
-			*plget->seq_id_wr = htons((tx_cnt & SEQ_ID_MASK) | sid);
+			sid_wr(plget, htons((tx_cnt & SEQ_ID_MASK) | sid));
 			if (!(plget->flags & PLF_TS_ID_ALLOWED))
-				*plget->packet_id_wr = tx_cnt;
+				tid_wr(plget, tx_cnt);
 			if (++tx_cnt >= pkt_num)
 				txlat_stop_timer(timer_fd);
 
 			/* send packet */
 			clock_gettime(CLOCK_REALTIME, &ts);
-			ret = sendto(plget->sock, plget->packet,
-					plget->payload_size, 0,
-					(struct sockaddr *)&plget->sk_addr,
-					sizeof(plget->sk_addr));
+			ret = txlat_sendto(plget);
 
 			stats_push(&tx_app_v, &ts);
-			if (ret != plget->payload_size) {
+			if (ret != plget->sk_payload_size) {
 				if (ret < 0)
 					perror("sendto");
 				else
@@ -203,19 +216,19 @@ void txlat_proc_packet(struct plgett *plget)
 	struct timespec ts;
 	int ret;
 
-	fds[0].fd = plget->sock;
+	fds[0].fd = plget->sfd;
 	fds[0].events = POLLERR;
 	ts_num = plget->dev_deep + 1;
 
 	/* send packet */
 	clock_gettime(CLOCK_REALTIME, &ts);
-	ret = sendto(plget->sock, plget->packet,
-			plget->payload_size, 0,
+	ret = sendto(plget->sfd, plget->pkt,
+			plget->sk_payload_size, 0,
 			(struct sockaddr *)&plget->sk_addr,
 			sizeof(plget->sk_addr));
 
 	stats_push(&tx_app_v, &ts);
-	if (ret != plget->payload_size) {
+	if (ret != plget->sk_payload_size) {
 		if (ret < 0)
 			perror("sendto");
 		else

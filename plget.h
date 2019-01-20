@@ -18,9 +18,13 @@
 #include <netpacket/packet.h>
 #include <net/ethernet.h>
 #include <netinet/in.h>
-#include <linux/if.h>
+#include <net/if.h>
 #include <sys/time.h>
 #include "stat.h"
+
+#ifndef XDP_RX_RING
+#include "linux/if_xdp.h"
+#endif
 
 #define ts_correct(ts)			((ts)->tv_sec || (ts)->tv_nsec)
 #define NSEC_PER_SEC			1000000000ULL
@@ -51,6 +55,8 @@ extern struct stats temp;
 #define PLF_BUSYPOLL			BIT(9)
 #define PLF_TS_ID_ALLOWED		BIT(10)
 #define PLF_SCHED_STAT			BIT(11)
+#define PLF_QUEUE			BIT(12)
+#define PLF_ZERO_COPY			BIT(13)
 
 #define PLF_PRINTOUT			(PLF_HW_STAT |\
 					PLF_HW_GAP_STAT |\
@@ -61,20 +67,25 @@ extern struct stats temp;
 
 enum pkt_type {
 	PKT_UDP,
-	PKT_ETH
+	PKT_ETH,
+	PKT_XDP,
 };
 
 enum test_mod {
 	RX_LAT = 1,
 	TX_LAT = 2,
-	EXT_LAT = 3,
+	RTT_MOD = 3, 	/* round trip time mode (external latency) */
 	ECHO_LAT = 4,
 	PKT_GEN = 5,
 	RX_RATE = 6,
 };
 
 struct plgett {
-	struct in_addr iaddr;
+	union {
+		struct in_addr iaddr;
+		struct sockaddr_ll iaddr2;
+		struct sockaddr_xdp iaddr3;
+	};
 	unsigned char macaddr[8];
 	struct sockaddr_ll sk_addr;
 	enum test_mod mod;
@@ -84,20 +95,23 @@ struct plgett {
 	enum pkt_type pkt_type;
 	int pkt_size;
 	int pkt_num;
-	int payload_size;
-	int sock;
+	int sk_payload_size;	/* socket payload size */
+	int sfd;
 	int port;
 	int flags;
 	int prio;
+	int queue;		/* must be used by XDP socket */
 	int busypoll_time;
 	int stream_id;
 	int dev_deep;
+	struct xsock *xsk;	/* xdp soket info */
 
 	/* packet related info */
-	char *packet;
-	__u16 *seq_id_wr;
-	unsigned int *packet_id_wr;
-	char *magic_rd;
+	char *pkt;
+	int off_sid_wr;		/* PTP sequential id */
+	int off_tid_wr;		/* wr offset for ts id for identification */
+	int off_tid_rd;		/* rd offset for ts id for identification */
+	int off_magic_rd;	/* magic num to validate packet */
 
 	/* rx packet related info */
 	char data[ETH_DATA_LEN];
@@ -106,9 +120,52 @@ struct plgett {
 	struct msghdr msg;
 };
 
-int setup_sock(int sock, int flags);
+int setup_sock(int sfd, int flags);
 int plget_setup_timer(struct plgett *plget);
 struct stats *plget_best_rx_vect(void);
 struct stats *plget_best_tx_vect(void);
+
+static inline char *magic_rd(struct plgett *plget, int pkt_size)
+{
+	return (char *)(plget->data + plget->off_magic_rd + pkt_size);
+}
+
+static inline void tid_wr(struct plgett *plget, unsigned int tid)
+{
+	int i;
+	char *p1, *p2;
+
+	p1 = (char *)&tid;
+	p2 = (char *)(plget->off_tid_wr + plget->pkt);
+
+	for (i = 0; i < sizeof(tid); i++)
+		*p2++ = *p1++;
+}
+
+static inline unsigned int tid_rd(struct plgett *plget, int pkt_size)
+{
+	unsigned int tid;
+	char *p1, *p2;
+	int i;
+
+	p1 = (char *)&tid;
+	p2 = (char *)(plget->data + plget->off_tid_rd + pkt_size);
+
+	for (i = 0; i < sizeof(tid); i++)
+		*p1++ = *p2++;
+
+	return tid;
+}
+
+static inline void sid_wr(struct plgett *plget, __u16 sid)
+{
+	char *p1, *p2;
+
+	p1 = (char *)&sid;
+	p2 = plget->off_sid_wr + plget->pkt;
+
+	*p2++ = *p1++;
+	*p2 = *p1;
+}
 
 #endif

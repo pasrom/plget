@@ -19,7 +19,7 @@
 #include <arpa/inet.h>
 #include <string.h>
 
-#define PLGET_NAME_VER			"plget v0.3"
+#define PLGET_NAME_VER			"plget v0.4"
 #define PTP_EVENT_PORT			319
 #define PTP_GENERAL_PORT		320
 #define PTP_PRIMARY_MCAST_IPADDR	"224.0.1.129"
@@ -38,10 +38,10 @@ static void plget_usage(void)
 	printf("\t\t\t\t\t\tport 319 or 320 is special and address 224.0.1.29 "
 	       "by default if not overwritten\n");
 	printf("\tt TYPE\t\t--type=TYPE\t\t:type of packet, can be udp, avtp, "
-	       "ptpl2, ptpl4\n");
+	       "ptpl2, ptpl4, xdp_ptpl2\n");
 	printf("\ti NAME\t\t--if=NAME\t\t:interface name\n");
 	printf("\tm MODE\t\t--mode=MODE\t\t:\"rx-lat\" or \"tx-lat\" or "
-	       "\"echo-lat\" or \"pkt-gen\" or \"ext-lat\" or \"rx-rate\" "
+	       "\"echo-lat\" or \"pkt-gen\" or \"rtt\" or \"rx-rate\" "
 	       "mode\n");
 	printf("\tn NUM\t\t--pkt-num=NUM\t\t:number of packets to be sent or "
 	       "received\n");
@@ -72,6 +72,8 @@ static void plget_usage(void)
 	       "by default 1 is used. That is if vlan + bridge then -d 3, and "
 	       "so on, basically it's equal to number of sched timestamps "
 	       "expected\n");
+	printf("\tq QUEUE\t\t--queue=QUEUE\t\t:set queue for xpd socket\n");
+	printf("\tz \t\t--zero-copy\t\t:force zero-copy XDP mode\n");
 }
 
 static struct option plget_options[] = {
@@ -90,6 +92,8 @@ static struct option plget_options[] = {
 	{"rel-time",	required_argument,	0, 'r'},
 	{"stream-id",	required_argument,	0, 'k'},
 	{"dev-deep",	required_argument,	0, 'd'},
+	{"queue",	required_argument,	0, 'q'},
+	{"zero-copy",	no_argument,		0, 'z'},
 	{NULL, 0, NULL, 0},
 };
 
@@ -111,7 +115,7 @@ static void plget_check_args(struct plgett *plget)
 
 	/* set default lat printout */
 	if ((mod == TX_LAT || mod == RX_LAT || mod == ECHO_LAT ||
-	     mod == EXT_LAT) && !(plget->flags & PLF_PRINTOUT))
+	     mod == RTT_MOD) && !(plget->flags & PLF_PRINTOUT))
 		plget->flags |= PLF_LATENCY_STAT;
 
 	if (mod == RX_RATE && plget->flags & PLF_PRINTOUT) {
@@ -148,14 +152,14 @@ static void plget_check_args(struct plgett *plget)
 		}
 
 		need_addr = (!plget->iaddr.s_addr) && (mod == TX_LAT ||
-			    mod == ECHO_LAT || mod == EXT_LAT ||
+			    mod == ECHO_LAT || mod == RTT_MOD ||
 			    mod == PKT_GEN);
 
 		plget->flags |= PLF_TS_ID_ALLOWED;
 		break;
 	case PKT_ETH:
 		if (plget->macaddr[0] == '\0' && (plget->flags & PLF_PTP)) {
-			if (mod == TX_LAT || mod == PKT_GEN || mod == EXT_LAT ||
+			if (mod == TX_LAT || mod == PKT_GEN || mod == RTT_MOD ||
 			    mod == ECHO_LAT) {
 				sscanf(PTP_PRIMARY_MCAST_MACADDR,
 				       "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
@@ -176,10 +180,20 @@ static void plget_check_args(struct plgett *plget)
 		}
 
 		need_addr = (plget->macaddr[0] == '\0') &&
-			    (mod == TX_LAT || mod == EXT_LAT || mod == PKT_GEN);
+			    (mod == TX_LAT || mod == RTT_MOD || mod == PKT_GEN);
 
 		if (plget->port)
 			printf("Cannot specify port for non UDP packets\n");
+		break;
+	case PKT_XDP:
+		if (plget->if_name[0] == '\0')
+			plget_fail("For XDP sockets, dev has to be specified");
+
+		if (!(plget->flags & PLF_QUEUE))
+			plget->queue = 0;
+
+		need_addr = (plget->macaddr[0] == '\0') &&
+			    (mod == TX_LAT || mod == RTT_MOD || mod == PKT_GEN);
 		break;
 	default:
 		plget_fail("Please, specify packet_type");
@@ -226,6 +240,9 @@ static void plget_set_packet_type(struct plgett *plget)
 	} else if (!strcmp("ptpl2", optarg)) {
 		plget->pkt_type = PKT_ETH;
 		plget->flags |= PLF_PTP;
+	} else if (!strcmp("xdp_ptpl2", optarg)) {
+		plget->pkt_type = PKT_XDP;
+		plget->flags |= PLF_PTP;
 	} else {
 		plget_fail("unsupported packet type");
 	}
@@ -237,8 +254,8 @@ static void plget_set_mode(struct plgett *plget)
 		plget->mod = TX_LAT;
 	else if (!strcmp("rx-lat", optarg))
 		plget->mod = RX_LAT;
-	else if (!strcmp("ext-lat", optarg))
-		plget->mod = EXT_LAT;
+	else if (!strcmp("rtt", optarg))
+		plget->mod = RTT_MOD;
 	else if (!strcmp("echo-lat", optarg))
 		plget->mod = ECHO_LAT;
 	else if (!strcmp("pkt-gen", optarg))
@@ -246,7 +263,7 @@ static void plget_set_mode(struct plgett *plget)
 	else if (!strcmp("rx-rate", optarg))
 		plget->mod = RX_RATE;
 	else
-		plget_fail("uknown mode");
+		plget_fail("unkown mode");
 }
 
 static void plget_set_address(struct plgett *plget)
@@ -255,7 +272,8 @@ static void plget_set_address(struct plgett *plget)
 
 	if (plget->pkt_type == PKT_UDP) {
 		inet_aton(optarg, &plget->iaddr);
-	} else if (plget->pkt_type == PKT_ETH) {
+	} else if (plget->pkt_type == PKT_ETH ||
+		   plget->pkt_type == PKT_XDP) {
 		ret =
 		sscanf(optarg, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
 			&plget->macaddr[0], &plget->macaddr[1],
@@ -268,7 +286,7 @@ static void plget_set_address(struct plgett *plget)
 	} else if (!plget->pkt_type) {
 		plget_fail("Set paket type first");
 	} else {
-		plget_fail("uknown pkt type");
+		plget_fail("unkown pkt type");
 	}
 }
 
@@ -317,7 +335,7 @@ static void read_args(struct plgett *plget, int argc, char **argv)
 {
 	int idx, opt;
 
-	while ((opt = getopt_long(argc, argv, "s:u:p:i:m:n:l:a:t:f:b:cw:r:k:d:",
+	while ((opt = getopt_long(argc, argv, "s:u:p:i:m:n:l:a:t:f:b:cw:r:k:d:q:z",
 	       plget_options, &idx)) != -1) {
 		switch (opt) {
 		case 's':
@@ -367,6 +385,10 @@ static void read_args(struct plgett *plget, int argc, char **argv)
 		case 'd':
 			plget->dev_deep = atoi(optarg);
 			break;
+		case 'q':
+			plget->queue = atoi(optarg);
+		case 'z':
+			plget->flags |= PLF_ZERO_COPY;
 		default:
 			plget_fail("unknown option");
 		}

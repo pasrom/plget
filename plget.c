@@ -29,14 +29,17 @@
 #include "plget.h"
 #include "rx_lat.h"
 #include "tx_lat.h"
-#include "ext_lat.h"
+#include "rtt.h"
 #include "echo_lat.h"
 #include <sys/mman.h>
 #include "pkt_gen.h"
 #include "result.h"
+#include "xdp_sock.h"
 
 #define ALIGN_ROUNDUP(x, align)\
 	((align) * (((x) + align - 1) / (align)))
+
+#define ALIGN(x) ALIGN_ROUNDUP(x, sizeof(long))
 
 #define ALIGN_ROUNDUP_PTR(x, align)\
 	((void *)ALIGN_ROUNDUP((uintptr_t)(x), (uintptr_t)(align)))
@@ -59,6 +62,8 @@ static unsigned char ptpv2_sync_header[] = {
 	0x00, 0x80, 0x63, 0xff, 0xff, 0x00, 0x09, 0xba, 0x00, 0x01,
 	0x00, 0x74, 0x00, 0x00
 };
+
+#define PTP_HSIZE	sizeof(ptpv2_sync_header)
 
 int plget_setup_timer(struct plgett *plget)
 {
@@ -87,18 +92,18 @@ int plget_setup_timer(struct plgett *plget)
 	return fd;
 }
 
-int setup_sock(int sock, int flags)
+int setup_sock_ts(int sfd, int flags)
 {
 	int val, err;
 	unsigned int len = sizeof(val);
 
 	val = flags;
 	printf("setting ts_flags: 0x%x\n", val);
-	err = setsockopt(sock, SOL_SOCKET, SO_TIMESTAMPING, &val, len);
+	err = setsockopt(sfd, SOL_SOCKET, SO_TIMESTAMPING, &val, len);
 	if (err)
 		return perror("setsockopt"), -errno;
 
-	err = getsockopt(sock, SOL_SOCKET, SO_TIMESTAMPING, &val, &len);
+	err = getsockopt(sfd, SOL_SOCKET, SO_TIMESTAMPING, &val, &len);
 	if (err)
 		return perror("getsockopt"), -errno;
 
@@ -120,7 +125,7 @@ static int enable_hw_timestamping(struct plgett *plget)
 
 	strncpy(ifreq_ts.ifr_name, plget->if_name, sizeof(ifreq_ts.ifr_name));
 	ifreq_ts.ifr_data = (void *)&hwconfig;
-	ret = ioctl(plget->sock, SIOCGHWTSTAMP, &ifreq_ts);
+	ret = ioctl(plget->sfd, SIOCGHWTSTAMP, &ifreq_ts);
 	printf("SIOCGHWTSTAMP: tx_type was %d; rx_filter was %d\n",
 	       hwconfig.tx_type, hwconfig.rx_filter);
 
@@ -131,10 +136,10 @@ static int enable_hw_timestamping(struct plgett *plget)
 	ifreq_ts.ifr_data = (void *)&hwconfig;
 
 	need_tx_hwts = plget->mod == TX_LAT ||
-		       plget->mod == EXT_LAT ||
+		       plget->mod == RTT_MOD ||
 		       plget->mod == ECHO_LAT;
 	need_rx_hwts = plget->mod == RX_LAT ||
-		       plget->mod == EXT_LAT ||
+		       plget->mod == RTT_MOD ||
 		       plget->mod == RX_RATE ||
 		       plget->mod == ECHO_LAT;
 
@@ -156,14 +161,15 @@ static int enable_hw_timestamping(struct plgett *plget)
 	}
 
 	hwconfig_requested = hwconfig;
-	ret = ioctl(plget->sock, SIOCSHWTSTAMP, &ifreq_ts);
+	ret = ioctl(plget->sfd, SIOCSHWTSTAMP, &ifreq_ts);
 	if (ret < 0) {
 		if (hwconfig_requested.tx_type == HWTSTAMP_TX_OFF &&
 		    hwconfig_requested.rx_filter == HWTSTAMP_FILTER_NONE)
 			printf("SIOCSHWTSTAMP: disabling h/w time stamping not possible\n");
 		else
-			printf("%s: %d\n", "SIOCSHWTSTAMP", ret);
-		ret = -errno;
+			printf("SIOCSHWTSTAMP: NIC h/w ts seems like is not supported: %d\n", ret);
+
+		return -errno;
 	}
 
 	printf("SIOCSHWTSTAMP: tx_type %d requested, got %d; rx_filter %d requested, got %d\n",
@@ -178,30 +184,30 @@ static int udp_socket(struct plgett *plget)
 	struct sockaddr_in *addr = (struct sockaddr_in *)&plget->sk_addr;
 	int ip_multicast_loop = 0;
 	struct ip_mreqn mreq;
-	int sock, ret;
+	int sfd, ret;
 
-	sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (sock < 0)
+	sfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (sfd < 0)
 		return perror("socket"), -errno;
 
 	addr->sin_family = AF_INET;
 	addr->sin_port = htons(plget->port);
 
-	ret = bind(sock, (struct sockaddr *)addr, sizeof(struct sockaddr_in));
+	ret = bind(sfd, (struct sockaddr *)addr, sizeof(struct sockaddr_in));
 	if (ret < 0)
 		return perror("Couldn't bind"), -errno;
 
 	addr->sin_addr = plget->iaddr;
 
 	if (plget->flags & PLF_PRIO) {
-		ret = setsockopt(sock, SOL_SOCKET, SO_PRIORITY, &plget->prio,
+		ret = setsockopt(sfd, SOL_SOCKET, SO_PRIORITY, &plget->prio,
 				 sizeof(plget->prio));
 		if (ret < 0)
 			return perror("Couldn't set priority"), -errno;
 	}
 
 	if (plget->flags & PLF_BUSYPOLL) {
-		ret = setsockopt(sock, SOL_SOCKET, SO_BUSY_POLL,
+		ret = setsockopt(sfd, SOL_SOCKET, SO_BUSY_POLL,
 				 &plget->busypoll_time,
 				 sizeof(plget->busypoll_time));
 		if (ret < 0)
@@ -209,40 +215,50 @@ static int udp_socket(struct plgett *plget)
 	}
 
 	/* bind socket to the interface */
-	ret = setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, plget->if_name,
+	ret = setsockopt(sfd, SOL_SOCKET, SO_BINDTODEVICE, plget->if_name,
 			 sizeof(plget->if_name));
 	if (ret < 0)
 		return perror("Couldn't bind to the interface"), -errno;
 
 	if (!(plget->flags & PLF_PTP))
-		return sock;
+		return sfd;
 
 	/* set multicast group for outgoing packets */
 	mreq.imr_multiaddr = plget->iaddr;
 	mreq.imr_address.s_addr = htonl(INADDR_ANY);
 	mreq.imr_ifindex = if_nametoindex(plget->if_name);
-	ret = setsockopt(sock, IPPROTO_IP, IP_MULTICAST_IF, &mreq,
+	ret = setsockopt(sfd, IPPROTO_IP, IP_MULTICAST_IF, &mreq,
 			 sizeof(mreq));
 	if (ret < 0)
 		return perror("set multicast"), -errno;
 
 	if (plget->mod == TX_LAT || plget->mod == PKT_GEN)
-		return sock;
+		return sfd;
 
 	/* join multicast group */
-	ret = setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq,
+	ret = setsockopt(sfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq,
 			 sizeof(struct ip_mreqn));
 	if (ret < 0)
 		return perror("join multicast group"), -errno;
 
 	printf("joined mcast group: %s\n", inet_ntoa(plget->iaddr));
 
-	ret = setsockopt(sock, IPPROTO_IP, IP_MULTICAST_LOOP,
+	ret = setsockopt(sfd, IPPROTO_IP, IP_MULTICAST_LOOP,
 		         &ip_multicast_loop, sizeof(ip_multicast_loop));
 	if (ret < 0)
 		perror("loop multicast");
 
-	return sock;
+	return sfd;
+}
+
+static void specify_protocol(struct plgett *plget, __u16 *protocol)
+{
+	if (plget->flags & PLF_AVTP)
+		*protocol = htons(ETH_P_TSN);
+	else if (plget->flags & PLF_PTP)
+		*protocol = htons(ETH_P_1588);
+	else
+		*protocol = 0;
 }
 
 static int packet_socket(struct plgett *plget)
@@ -251,17 +267,12 @@ static int packet_socket(struct plgett *plget)
 	unsigned char *mac = plget->macaddr;
 	struct packet_mreq mreq;
 	__u16 protocol;
-	int sock, ret;
+	int sfd, ret;
 
-	if (plget->flags & PLF_AVTP)
-		protocol = htons(ETH_P_TSN);
-	else if (plget->flags & PLF_PTP)
-		protocol = htons(ETH_P_1588);
-	else
-		protocol = 0;
+	specify_protocol(plget, &protocol);
 
-	sock = socket(AF_PACKET, SOCK_DGRAM, protocol);
-	if (sock < 0)
+	sfd = socket(AF_PACKET, SOCK_DGRAM, protocol);
+	if (sfd < 0)
 		return perror("socket"), -errno;
 
 	addr->sll_family = AF_PACKET;
@@ -271,7 +282,7 @@ static int packet_socket(struct plgett *plget)
 	if (plget->if_name[0] != '\0')
 		addr->sll_ifindex = if_nametoindex(plget->if_name);
 
-	ret = bind(sock, (struct sockaddr *)addr, sizeof(struct sockaddr_ll));
+	ret = bind(sfd, (struct sockaddr *)addr, sizeof(struct sockaddr_ll));
 	if (ret < 0)
 		return perror("Couldn't bind() to interface"), -errno;
 
@@ -279,25 +290,33 @@ static int packet_socket(struct plgett *plget)
 	memcpy(addr->sll_addr, mac, ETH_ALEN);
 
 	if (plget->flags & PLF_PRIO) {
-		ret = setsockopt(sock, SOL_SOCKET, SO_PRIORITY, &plget->prio,
+		ret = setsockopt(sfd, SOL_SOCKET, SO_PRIORITY, &plget->prio,
 				 sizeof(plget->prio));
 		if (ret < 0)
 			return perror("Couldn't set priority"), -errno;
 	}
 
+	if (plget->flags & PLF_BUSYPOLL) {
+		ret = setsockopt(sfd, SOL_SOCKET, SO_BUSY_POLL,
+				 &plget->busypoll_time,
+				 sizeof(plget->busypoll_time));
+		if (ret < 0)
+			return perror("Couldn't set busy poll time"), -errno;
+	}
+
 	if (plget->mod == TX_LAT || plget->mod == PKT_GEN)
-		return sock;
+		return sfd;
 
 	 /* join multicast group if address is provided */
 	if (*mac == '\0')
-		return sock;
+		return sfd;
 
 	mreq.mr_ifindex = addr->sll_ifindex;
 	mreq.mr_type = PACKET_MR_MULTICAST;
 	mreq.mr_alen = ETH_ALEN;
 	memcpy(&mreq.mr_address, mac, ETH_ALEN);
 
-	ret = setsockopt(sock, SOL_PACKET,
+	ret = setsockopt(sfd, SOL_PACKET,
 			 PACKET_ADD_MEMBERSHIP, &mreq,
 			 sizeof(struct packet_mreq));
 	if (ret < 0) {
@@ -308,38 +327,103 @@ static int packet_socket(struct plgett *plget)
 	printf("joined mcast group: %02x:%02x:%02x:%02x:%02x:%02x\n",
 	       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-	return sock;
+	return sfd;
 }
 
 static int plget_create_socket(struct plgett *plget)
 {
 	if (plget->pkt_type == PKT_UDP)
-		plget->sock = udp_socket(plget);
+		plget->sfd = udp_socket(plget);
 	else if (plget->pkt_type == PKT_ETH)
-		plget->sock = packet_socket(plget);
+		plget->sfd = packet_socket(plget);
+	else if (plget->pkt_type == PKT_XDP)
+		plget->sfd = xdp_socket(plget);
 	else
 		plget_fail("uknown packet type");
 
-	if (plget->sock < 0)
+	if (plget->sfd < 0)
 		return 1;
 
 	return 0;
 }
 
+static void init_pkt_ether_header(struct plgett *plget)
+{
+	struct ether_header *eth;
+	struct ifreq ifr;
+	int ret;
+
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, plget->if_name, sizeof(ifr.ifr_name));
+
+	eth = (struct ether_header *)plget->pkt;
+	memcpy(eth->ether_dhost, plget->macaddr, ETH_ALEN);
+
+	ret = ioctl(plget->sfd, SIOCGIFHWADDR, &ifr);
+	if (ret) {
+		memcpy(eth->ether_shost, plget->macaddr, ETH_ALEN);
+		printf("cann't get interface hw address\n");
+	} else {
+		memcpy(eth->ether_shost, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+	}
+
+	specify_protocol(plget, &eth->ether_type);
+}
+
+static void fill_in_packets(struct plgett *plget)
+{
+	int ptp_payload_size;
+	int n, i, j;
+	char *dp;
+
+	ptp_payload_size = plget->sk_payload_size;
+	if (plget->pkt_type == PKT_XDP)
+		ptp_payload_size -= ETH_HLEN;
+
+	if (plget->flags & PLF_PTP)
+		ptp_payload_size -= PTP_HSIZE;
+
+	n = (plget->pkt_type == PKT_XDP) ? FRAME_NUM : 1;
+	for (i = 0; i < n; i++) {
+		if (plget->pkt_type == PKT_XDP) {
+			j = FRAME_SIZE * i;
+			plget->pkt = &plget->xsk->umem->frames[j];
+
+			init_pkt_ether_header(plget);
+			dp = plget->pkt + ETH_HLEN;
+		} else {
+			dp = plget->pkt;
+		}
+
+		if (plget->flags & PLF_PTP) {
+			memcpy(dp, ptpv2_sync_header, PTP_HSIZE);
+			dp += PTP_HSIZE;
+		}
+
+		if (!(plget->flags & PLF_TS_ID_ALLOWED) &&
+		    plget->mod != ECHO_LAT)
+			*dp++ = MAGIC;
+
+		for (j = 0; j < ptp_payload_size; j++)
+			*dp++ = (rand() % 230) + 1;
+	}
+
+	if (plget->pkt_type == PKT_XDP)
+		plget->pkt = plget->xsk->umem->frames;
+}
+
 static int plget_create_packet(struct plgett *plget)
 {
 	int payload_size;
-	char *dp;
-	int i;
 
 	/* check settings */
 	if (plget->pkt_size &&
 	    (plget->pkt_size < 64 || plget->pkt_size > ETH_DATA_LEN)) {
-			printf("incorrect packet size\n");
+			printf("incorrect packet size: 64 <= size <= 1500\n");
 			return -EINVAL;
 	}
 
-	/* calculate size and payload */
+	/* adjust size and payload for packet */
 	if (plget->pkt_type == PKT_UDP) {
 		if (plget->flags & PLF_PTP) {
 			if (plget->pkt_size &&
@@ -363,35 +447,26 @@ static int plget_create_packet(struct plgett *plget)
 		} else if (!plget->pkt_size)
 			plget->pkt_size = 64;
 
-		payload_size = plget->pkt_size - 14;
+		payload_size = plget->pkt_size;
+		if (plget->pkt_type != PKT_XDP)
+			payload_size -= ETH_HLEN;
 	}
 
 	/* allocate packet */
-	plget->payload_size = payload_size;
-	plget->packet = malloc(payload_size);
-	if (!plget->packet)
-		return -ENOMEM;
+	plget->sk_payload_size = payload_size;
+	if (plget->pkt_type != PKT_XDP) {
+		plget->pkt = malloc(payload_size);
+		if (!plget->pkt)
+			return -ENOMEM;
+	}
 
-	/* fill in payload */
-	if (plget->flags & PLF_PTP) {
-		memcpy(plget->packet, ptpv2_sync_header,
-		       sizeof(ptpv2_sync_header));
-
-		dp = plget->packet + sizeof(ptpv2_sync_header);
-		payload_size -= sizeof(ptpv2_sync_header);
-	} else
-		dp = plget->packet;
-
-	for (i = 0; i < payload_size; i++)
-		*dp++ = (rand() % 230) + 1;
-
+	fill_in_packets(plget);
 	return 0;
 }
 
 static void fill_in_data_pointers(struct plgett *plget)
 {
-	int ptp_header_size;
-	char *magic_wr;
+	int off = 0;
 
 	plget->iov.iov_base = plget->data;
 	plget->iov.iov_len = sizeof(plget->data);
@@ -403,36 +478,29 @@ static void fill_in_data_pointers(struct plgett *plget)
 	if (plget->mod == RX_LAT || plget->mod == RX_RATE)
 		return;
 
-	ptp_header_size =
-		ALIGN_ROUNDUP(sizeof(ptpv2_sync_header), sizeof(long));
-
-	if (!(plget->flags & PLF_TS_ID_ALLOWED)) {
-		if (plget->mod != ECHO_LAT) {
-			magic_wr = plget->packet;
-			if (plget->flags & PLF_PTP)
-				magic_wr += ptp_header_size;
-
-			*magic_wr = MAGIC;
-			plget->packet_id_wr =
-				(typeof(plget->packet_id_wr))
-				(magic_wr + sizeof(*magic_wr));
-		}
-
-		plget->magic_rd = plget->data;
-		if (plget->mod != ECHO_LAT)
-			plget->magic_rd -= plget->payload_size;
-
-		if (plget->flags & PLF_PTP)
-			plget->magic_rd += ptp_header_size;
-	}
+	if (plget->pkt_type == PKT_XDP)
+		off += ETH_HLEN;
 
 	if (plget->flags & PLF_PTP)
-		plget->seq_id_wr = (__u16 *)(plget->packet +
-				   OFF_PTP_SEQUENCE_ID);
+		plget->off_sid_wr = off + OFF_PTP_SEQUENCE_ID;
 	else
-		plget->seq_id_wr = (__u16 *)plget->packet;
+		plget->off_sid_wr = 0;
 
-	*plget->seq_id_wr = plget->stream_id;
+	if (!(plget->flags & PLF_TS_ID_ALLOWED)) {
+		if (plget->flags & PLF_PTP)
+			off += PTP_HSIZE;
+
+		if (plget->mod != ECHO_LAT)
+			plget->off_tid_wr = ALIGN(off + 1);
+
+		plget->off_magic_rd = off;
+		plget->off_tid_rd = ALIGN(off + 1);
+
+		if (plget->mod != ECHO_LAT) {
+			plget->off_magic_rd -= plget->sk_payload_size;
+			plget->off_tid_rd -= plget->sk_payload_size;
+		}
+	}
 }
 
 static int init_test(struct plgett *plget)
@@ -447,12 +515,12 @@ static int init_test(struct plgett *plget)
 	enable_hw_timestamping(plget);
 	res_title_print(plget);
 
-	if (mod == EXT_LAT || mod == ECHO_LAT || mod == TX_LAT ||
+	if (mod == RTT_MOD || mod == ECHO_LAT || mod == TX_LAT ||
 	    mod == RX_LAT)
 		stats_reserve(&temp, plget->pkt_num);
 
-	/* reserve memory and set ts flags */
-	if (mod == EXT_LAT || mod == ECHO_LAT || mod == TX_LAT) {
+	/* reserve stats memory and set ts flags */
+	if (mod == RTT_MOD || mod == ECHO_LAT || mod == TX_LAT) {
 		if (plget->flags & PLF_PRINTOUT) {
 			stats_reserve(&tx_app_v, plget->pkt_num);
 			stats_reserve(&tx_sw_v, plget->pkt_num);
@@ -474,7 +542,7 @@ static int init_test(struct plgett *plget)
 		}
 	}
 
-	if (mod == EXT_LAT || mod == ECHO_LAT || mod == RX_LAT ||
+	if (mod == RTT_MOD || mod == ECHO_LAT || mod == RX_LAT ||
 	    mod == RX_RATE) {
 		if (plget->flags & PLF_PRINTOUT) {
 			stats_reserve(&rx_app_v, plget->pkt_num);
@@ -487,23 +555,25 @@ static int init_test(struct plgett *plget)
 
 	ts_flags |= SOF_TIMESTAMPING_RAW_HARDWARE;
 
-	if (mod == EXT_LAT || mod == TX_LAT || mod == PKT_GEN) {
+	/* create and fill in packet */
+	if (mod == RTT_MOD || mod == TX_LAT || mod == PKT_GEN) {
 		ret = plget_create_packet(plget);
 		if (ret)
 			return ret;
 	} else if (mod == ECHO_LAT) {
-		plget->packet = plget->data;
+		plget->pkt = plget->data;
 	}
 
+	/* for simplicity and speed */
 	fill_in_data_pointers(plget);
 
-	ret = setup_sock(plget->sock, ts_flags);
+	ret = setup_sock_ts(plget->sfd, ts_flags);
 	return ret;
 }
 
 int main(int argc, char **argv)
 {
-	struct plgett plget;
+	struct plgett *plget;
 	int ret;
 
 	if (argc == 1) {
@@ -511,10 +581,13 @@ int main(int argc, char **argv)
 		exit(0);
 	}
 
-	memset(&plget, 0, sizeof(plget));
-	plget_args(&plget, argc, argv);
+	plget = calloc(1, sizeof(struct plgett));
+	if (!plget)
+		return -ENOMEM;
 
-	ret = init_test(&plget);
+	plget_args(plget, argc, argv);
+
+	ret = init_test(plget);
 	if (ret)
 		return ret;
 
@@ -522,24 +595,24 @@ int main(int argc, char **argv)
 	if (mlockall(MCL_CURRENT | MCL_FUTURE))
 		perror("mlockall failed");
 
-	switch (plget.mod) {
+	switch (plget->mod) {
 	case RX_LAT:
-		ret = rxlat(&plget);
+		ret = rxlat(plget);
 		break;
 	case TX_LAT:
-		ret = txlat(&plget);
+		ret = txlat(plget);
 		break;
-	case EXT_LAT:
-		ret = extlat(&plget);
+	case RTT_MOD:
+		ret = rtt(plget);
 		break;
 	case ECHO_LAT:
-		ret = echolat(&plget);
+		ret = echolat(plget);
 		break;
 	case PKT_GEN:
-		ret = pktgen(&plget);
+		ret = pktgen(plget);
 		break;
 	case RX_RATE:
-		ret = rxrate(&plget);
+		ret = rxrate(plget);
 		break;
 	default:
 		plget_fail("didn't set mode with -m");
@@ -549,6 +622,6 @@ int main(int argc, char **argv)
 	if (ret)
 		return ret;
 
-	res_stats_print(&plget);
+	res_stats_print(plget);
 	exit(0);
 }

@@ -33,7 +33,7 @@ static void res_print_clock_info(int clock, char *clock_name)
 	if (ret < 0)
 		perror("clock_getres");
 
-	printf("-----------------------------------------|\n");
+	printf("-----------------------------------------\n");
 	printf("%s info:\n", clock_name);
 	printf("Declared resolution: %ldns\n", ts1.tv_nsec);
 
@@ -176,7 +176,7 @@ static int res_rx_lat_print(struct plgett *plget)
 		if (ts_correct(&plget->rtime))
 			rtime = &plget->rtime;
 		else
-			rtime = plget->mod == EXT_LAT ? tx_hw_v.start_ts :
+			rtime = plget->mod == RTT_MOD ? tx_hw_v.start_ts :
 							rx_hw_v.start_ts;
 
 		n |= stats_print("\nhw rx time, us", &rx_hw_v, print_flags,
@@ -205,7 +205,7 @@ static int res_rx_lat_print(struct plgett *plget)
 	return n;
 }
 
-static void res_ext_lat_print(struct plgett *plget)
+static void res_rtt_print(struct plgett *plget)
 {
 	struct stats *a_stat, *b_stat;
 	char *a_ts_base, *b_ts_base;
@@ -235,13 +235,13 @@ static void res_ext_lat_print(struct plgett *plget)
 		b_ts_base = "app";
 	}
 
-	printf("extarnal latency measurements based on "
+	printf("round trip time measurements based on "
 		"tx %s ts and rx %s ts\n", a_ts_base, b_ts_base);
 
 	stats_diff(b_stat, a_stat, &temp);
-	stats_print("\nexternal latency (doesn't include rx and "
+	stats_print("\nround trip time (doesn't include rx and "
 		    "tx latencies printed above, based on "
-		    "send/receive h/w or closest s/w "
+		    "send/receive NICs h/w or closest s/w "
 		    "timestamps), us", &temp, print_flags, NULL);
 }
 
@@ -287,7 +287,7 @@ void res_title_print(struct plgett *plget)
 	}
 
 	res_print_clock_info(ptp_fd, "PHC");
-	printf("-----------------------------------------|\n");
+	printf("-----------------------------------------\n");
 
 	/* Check roughly if timeline is same for Sys and PHC */
 	clock_gettime(ptp_fd, &ts1);
@@ -297,11 +297,11 @@ void res_title_print(struct plgett *plget)
 	if (res.tv_sec || usec_diff > 5000)
 		printf("You need to run phc2sys in order to align timeline\n");
 
-	printf("PHC vs CLOCK MONOTONIC= %lus %luns\n", res.tv_sec, res.tv_nsec);
+	printf("PHC vs CLOCK MONOTONIC = %lus %luns\n", res.tv_sec, res.tv_nsec);
 
 	close(ptp_fd);
 ptp_err:
-	printf("-----------------------------------------|\n");
+	printf("-----------------------------------------\n");
 }
 
 void res_print_time(void)
@@ -318,7 +318,7 @@ void res_print_time(void)
 void res_stats_print(struct plgett *plget)
 {
 	int mod = plget->mod;
-	int rx_tx_lat = mod == ECHO_LAT || mod == EXT_LAT;
+	int rx_tx_lat = mod == ECHO_LAT || mod == RTT_MOD;
 	int print_rx_lat = mod == RX_LAT || rx_tx_lat;
 	int print_tx_lat = mod == TX_LAT || rx_tx_lat;
 	int header_size = ETH_HLEN;
@@ -332,14 +332,14 @@ void res_stats_print(struct plgett *plget)
 	if (print_rx_lat)
 		n = res_rx_lat_print(plget);
 
-	if (mod == ECHO_LAT || mod == EXT_LAT) {
+	if (mod == ECHO_LAT || mod == RTT_MOD) {
 		if (n != n2)
 			printf("rx ts num != tx ts num: %d != %d\n", n, n2);
 
 		pnum = n > n2 ? n2 : n;
 
-		if (mod == EXT_LAT)
-			res_ext_lat_print(plget);
+		if (mod == RTT_MOD)
+			res_rtt_print(plget);
 	} else if (mod == PKT_GEN) {
 		pnum = plget->pkt_num;
 	} else {
@@ -350,7 +350,7 @@ void res_stats_print(struct plgett *plget)
 		if (plget->pkt_type == PKT_UDP)
 			header_size += 28;
 
-		plget->pkt_size = header_size + plget->payload_size;
+		plget->pkt_size = header_size + plget->sk_payload_size;
 	}
 
 	if (plget->pkt_size)
@@ -358,7 +358,7 @@ void res_stats_print(struct plgett *plget)
 
 	printf("number of packets: %d\n", pnum);
 
-	if (mod == TX_LAT || mod == EXT_LAT)
+	if (mod == TX_LAT || mod == RTT_MOD)
 		stats_vrate_print(res_best_tx_vect(), plget->pkt_size);
 
 	if (mod == RX_LAT || mod == ECHO_LAT)
